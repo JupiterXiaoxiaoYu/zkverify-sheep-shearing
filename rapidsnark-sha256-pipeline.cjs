@@ -279,21 +279,49 @@ class RapidsnarkSHA256Pipeline {
         return input;
     }
     
-    getAccountTempPaths(accountIndex) {
-        // Create unique temp file paths for each account
+    getAccountTempPaths(accountIndex, proofId = '') {
+        // Create unique temp file paths for each account and proof
+        const uniqueId = proofId ? `${accountIndex}_${proofId}` : `${accountIndex}`;
+        const timestamp = Date.now();
         return {
-            witnessPath: path.join(this.tempDir, `sha256_witness_${accountIndex}.wtns`),
-            proofPath: path.join(this.tempDir, `rapidsnark_sha256_proof_${accountIndex}.json`),
-            publicPath: path.join(this.tempDir, `rapidsnark_sha256_public_${accountIndex}.json`),
-            inputFile: path.join(this.tempDir, `sha256_input_${accountIndex}.json`)
+            witnessPath: path.join(this.tempDir, `sha256_witness_${uniqueId}_${timestamp}.wtns`),
+            proofPath: path.join(this.tempDir, `rapidsnark_sha256_proof_${uniqueId}_${timestamp}.json`),
+            publicPath: path.join(this.tempDir, `rapidsnark_sha256_public_${uniqueId}_${timestamp}.json`),
+            inputFile: path.join(this.tempDir, `sha256_input_${uniqueId}_${timestamp}.json`)
         };
     }
+
+    cleanupTempFiles(filePaths) {
+        // Clean up specific temporary files
+        if (Array.isArray(filePaths)) {
+            filePaths.forEach(filePath => {
+                try {
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                    }
+                } catch (error) {
+                    // Ignore cleanup errors
+                }
+            });
+        } else if (typeof filePaths === 'object') {
+            Object.values(filePaths).forEach(filePath => {
+                try {
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                    }
+                } catch (error) {
+                    // Ignore cleanup errors
+                }
+            });
+        }
+    }
     
-    async generateWitnessWithSnarkjs(input, accountIndex) {
+    async generateWitnessWithSnarkjs(input, accountIndex, proofId = '') {
         return new Promise((resolve, reject) => {
-            console.log(`🔨 Generating witness for account ${accountIndex + 1}...`);
+            const label = proofId ? `${proofId}` : 'single';
+            console.log(`🔨 Generating witness ${label} for account ${accountIndex + 1}...`);
             
-            const paths = this.getAccountTempPaths(accountIndex);
+            const paths = this.getAccountTempPaths(accountIndex, proofId);
             
             // Create input file
             fs.writeFileSync(paths.inputFile, JSON.stringify({ in: input }));
@@ -315,9 +343,10 @@ class RapidsnarkSHA256Pipeline {
             
             snarkjs.on('close', (code) => {
                 if (code === 0) {
-                    console.log(`✅ Witness generated successfully for account ${accountIndex + 1}`);
-                    resolve(input);
+                    console.log(`✅ Witness ${label} generated successfully for account ${accountIndex + 1}`);
+                    resolve({ input, paths });
                 } else {
+                    this.cleanupTempFiles(paths);
                     reject(new Error(`Witness generation failed with code ${code}. Error: ${stderr}`));
                 }
             });
@@ -328,11 +357,11 @@ class RapidsnarkSHA256Pipeline {
         });
     }
     
-    async generateProofWithRapidsnark(accountIndex) {
+    async generateProofWithRapidsnark(witnessData, proofId = '') {
         return new Promise((resolve, reject) => {
-            console.log(`⚡ Generating proof with rapidsnark for account ${accountIndex + 1}...`);
-            
-            const paths = this.getAccountTempPaths(accountIndex);
+            const { paths } = witnessData;
+            const label = proofId ? `${proofId}` : 'single';
+            console.log(`⚡ Generating proof ${label} with rapidsnark...`);
             
             // Clean up previous temp files
             [paths.proofPath, paths.publicPath].forEach(filePath => {
@@ -366,17 +395,22 @@ class RapidsnarkSHA256Pipeline {
                         // Keep as string array for zkVerify compatibility
                         const publicInputs = publicInputsRaw;
                         
-                        console.log(`✅ Proof generated successfully for account ${accountIndex + 1}!`);
+                        console.log(`✅ Proof ${label} generated successfully!`);
                         console.log(`📋 Public signals: [${publicInputs.slice(0, 3).join(', ')}...] (${publicInputs.length} total)`);
+                        
+                        // Clean up temp files after successful proof generation
+                        this.cleanupTempFiles(paths);
                         
                         resolve({
                             proof: proofData,
-                            publicInputs: publicInputs
+                            publicInputs: publicInputs,
+                            paths: paths
                         });
                     } catch (readError) {
                         reject(new Error(`Failed to read generated files: ${readError.message}`));
                     }
                 } else {
+                    this.cleanupTempFiles(paths);
                     reject(new Error(`Rapidsnark prover exited with code ${code}. Error: ${stderr}`));
                 }
             });
@@ -410,8 +444,8 @@ class RapidsnarkSHA256Pipeline {
                                 domainId: 0
                             });
 
-                        // Handle submission events
-                        events.on(ZkVerifyEvents.IncludedInBlock, (eventData) => {
+                        // Handle submission events with automatic cleanup
+                        const handleIncludedInBlock = (eventData) => {
                             console.log(`✅ Proof${proofLabel} from account ${accountIndex + 1} included in block:`, {
                                 account: `${accountAddress.slice(0, 8)}...`,
                                 statement: eventData.statement,
@@ -419,43 +453,53 @@ class RapidsnarkSHA256Pipeline {
                                 inputSummary: mockInputSummary
                             });
                             
-                            // Note: Account-specific stats updated in monitorAsyncSubmissions
+                            // Clean up event listeners and timeout to prevent memory leaks
+                            clearTimeout(timeoutId);
+                            events.removeListener(ZkVerifyEvents.IncludedInBlock, handleIncludedInBlock);
+                            events.removeListener('error', handleError);
                             
-                            // Save submission details
-                            try {
-                                if (!fs.existsSync('./data')) {
-                                    fs.mkdirSync('./data');
+                            // Save submission details (limit file creation)
+                            if (this.stats.totalAttempts % 10 === 0) { // Only save every 10th submission
+                                try {
+                                    if (!fs.existsSync('./data')) {
+                                        fs.mkdirSync('./data');
+                                    }
+                                    
+                                    const submissionData = {
+                                        account: accountAddress,
+                                        accountIndex: accountIndex + 1,
+                                        statement: eventData.statement,
+                                        aggregationId: eventData.aggregationId,
+                                        timestamp: new Date().toISOString(),
+                                        publicSignalsCount: publicInputs.length
+                                    };
+                                    
+                                    fs.writeFileSync(
+                                        `./data/sha256_submission_${this.stats.totalAttempts}.json`, 
+                                        JSON.stringify(submissionData, null, 2)
+                                    );
+                                } catch (saveError) {
+                                    console.error('❌ Error saving submission data:', saveError);
                                 }
-                                
-                                const submissionData = {
-                                    account: accountAddress,
-                                    accountIndex: accountIndex + 1,
-                                    inputSummary: mockInputSummary,
-                                    statement: eventData.statement,
-                                    aggregationId: eventData.aggregationId,
-                                    timestamp: new Date().toISOString(),
-                                    publicSignalsCount: publicInputs.length,
-                                    circuitSize: "k≈20 (1,031,716 constraints)"
-                                };
-                                
-                                fs.writeFileSync(
-                                    `./data/sha256_submission_${this.stats.totalAttempts}.json`, 
-                                    JSON.stringify(submissionData, null, 2)
-                                );
-                            } catch (saveError) {
-                                console.error('❌ Error saving submission data:', saveError);
                             }
                             
                             resolve(true);
-                        });
+                        };
 
-                        // Handle errors in events
-                        events.on('error', (error) => {
+                        const handleError = (error) => {
+                            clearTimeout(timeoutId);
+                            events.removeListener(ZkVerifyEvents.IncludedInBlock, handleIncludedInBlock);
+                            events.removeListener('error', handleError);
                             reject(error);
-                        });
+                        };
 
-                        // Set timeout for the submission
-                        setTimeout(() => {
+                        events.on(ZkVerifyEvents.IncludedInBlock, handleIncludedInBlock);
+                        events.on('error', handleError);
+
+                        // Set timeout for the submission with cleanup
+                        const timeoutId = setTimeout(() => {
+                            events.removeListener(ZkVerifyEvents.IncludedInBlock, handleIncludedInBlock);
+                            events.removeListener('error', handleError);
                             reject(new Error('Submission timeout after 20 seconds'));
                         }, 20000);
 
@@ -541,14 +585,14 @@ class RapidsnarkSHA256Pipeline {
             // Step 2: Generate witness
             const witnessStart = Date.now();
             console.log(`🔧 [${new Date().toLocaleTimeString()}] [${batchId}] Witness generation phase for account ${accountIndex + 1}`);
-            await this.generateWitnessWithSnarkjs(randomInput, accountIndex);
+            const witnessData = await this.generateWitnessWithSnarkjs(randomInput, accountIndex, 'single');
             const witnessTime = Date.now() - witnessStart;
             console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Witness completed for account ${accountIndex + 1} (${witnessTime}ms)`);
             
             // Step 3: Generate proof with rapidsnark  
             const proofStart = Date.now();
             console.log(`⚡ [${new Date().toLocaleTimeString()}] [${batchId}] Proof generation phase for account ${accountIndex + 1}`);
-            const { proof, publicInputs } = await this.generateProofWithRapidsnark(accountIndex);
+            const { proof, publicInputs } = await this.generateProofWithRapidsnark(witnessData, 'single');
             const proofTime = Date.now() - proofStart;
             console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof completed for account ${accountIndex + 1} (${proofTime}ms)`);
             
@@ -602,14 +646,14 @@ class RapidsnarkSHA256Pipeline {
             // Generate witness
             const witnessStart = Date.now();
             console.log(`🔧 [${new Date().toLocaleTimeString()}] [${batchId}] Witness generation phase for account ${accountIndex + 1}`);
-            await this.generateWitnessWithSnarkjs(randomInput, accountIndex);
+            const witnessData = await this.generateWitnessWithSnarkjs(randomInput, accountIndex, 'async');
             const witnessTime = Date.now() - witnessStart;
             console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Witness completed for account ${accountIndex + 1} (${witnessTime}ms)`);
             
             // Generate proof with rapidsnark  
             const proofStart = Date.now();
             console.log(`⚡ [${new Date().toLocaleTimeString()}] [${batchId}] Proof generation phase for account ${accountIndex + 1}`);
-            const { proof, publicInputs } = await this.generateProofWithRapidsnark(accountIndex);
+            const { proof, publicInputs } = await this.generateProofWithRapidsnark(witnessData, 'async');
             const proofTime = Date.now() - proofStart;
             console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof completed for account ${accountIndex + 1} (${proofTime}ms)`);
             
@@ -692,10 +736,10 @@ class RapidsnarkSHA256Pipeline {
             const witnessStart = Date.now();
             console.log(`🔧 [${new Date().toLocaleTimeString()}] [${batchId}] Triple witness generation phase for account ${accountIndex + 1}`);
             
-            const [witness1, witness2, witness3] = await Promise.all([
-                this.generateWitnessWithSnarkjs(randomInput1, accountIndex * 3),     // 使用不同的temp文件
-                this.generateWitnessWithSnarkjs(randomInput2, accountIndex * 3 + 1), // 使用不同的temp文件
-                this.generateWitnessWithSnarkjs(randomInput3, accountIndex * 3 + 2)  // 使用不同的temp文件
+            const [witnessData1, witnessData2, witnessData3] = await Promise.all([
+                this.generateWitnessWithSnarkjs(randomInput1, accountIndex, 'A'),     // 使用唯一ID
+                this.generateWitnessWithSnarkjs(randomInput2, accountIndex, 'B'),     // 使用唯一ID
+                this.generateWitnessWithSnarkjs(randomInput3, accountIndex, 'C')      // 使用唯一ID
             ]);
             
             const witnessTime = Date.now() - witnessStart;
@@ -706,9 +750,9 @@ class RapidsnarkSHA256Pipeline {
             console.log(`⚡ [${new Date().toLocaleTimeString()}] [${batchId}] Triple proof generation phase for account ${accountIndex + 1}`);
             
             const [proof1Result, proof2Result, proof3Result] = await Promise.all([
-                this.generateProofWithRapidsnark(accountIndex * 3),
-                this.generateProofWithRapidsnark(accountIndex * 3 + 1),
-                this.generateProofWithRapidsnark(accountIndex * 3 + 2)
+                this.generateProofWithRapidsnark(witnessData1, 'A'),
+                this.generateProofWithRapidsnark(witnessData2, 'B'),
+                this.generateProofWithRapidsnark(witnessData3, 'C')
             ]);
             
             const proofTime = Date.now() - proofStart;
@@ -871,6 +915,103 @@ class RapidsnarkSHA256Pipeline {
         
         // Update health server statistics
         this.healthServer.updateProofStats(this.stats.totalAttempts, this.stats.successful, this.stats.failed);
+        
+        // Periodic memory cleanup every 100 cycles
+        if (this.stats.totalAttempts % 100 === 0) {
+            this.performMemoryCleanup();
+        }
+    }
+
+    getSystemStats() {
+        const memUsage = process.memoryUsage();
+        const cpuUsage = process.cpuUsage();
+        
+        // Convert to more readable format
+        const stats = {
+            memory: {
+                heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024), // MB
+                heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024), // MB
+                rss: Math.round(memUsage.rss / 1024 / 1024), // MB (Resident Set Size)
+                external: Math.round(memUsage.external / 1024 / 1024), // MB
+                arrayBuffers: Math.round(memUsage.arrayBuffers / 1024 / 1024), // MB
+                heapPercentage: Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100),
+                systemPercentage: Math.round((memUsage.rss / (16 * 1024)) * 100) // 16GB system
+            },
+            cpu: {
+                user: Math.round(cpuUsage.user / 1000), // Convert microseconds to milliseconds
+                system: Math.round(cpuUsage.system / 1000)
+            }
+        };
+        
+        return stats;
+    }
+
+    performMemoryCleanup(forceCleanup = false) {
+        try {
+            const beforeStats = this.getSystemStats();
+            console.log('\n🧹 Performing memory cleanup...');
+            console.log(`📊 Before cleanup: ${beforeStats.memory.heapUsed}MB heap, ${beforeStats.memory.rss}MB RSS (${beforeStats.memory.systemPercentage}% of 16GB)`);
+            
+            // Adjust cleanup strategy based on 16GB total memory
+            let maxDataFiles = 100; // Default
+            let shouldForceGC = forceCleanup;
+            
+            if (beforeStats.memory.systemPercentage > 50) { // > 8GB (50% of 16GB)
+                maxDataFiles = 20; // Aggressive cleanup
+                shouldForceGC = true;
+                console.log(`⚠️  High system memory usage: ${beforeStats.memory.systemPercentage}% (${beforeStats.memory.rss}MB / 16GB)`);
+            } else if (beforeStats.memory.systemPercentage > 25) { // > 4GB (25% of 16GB)
+                maxDataFiles = 50; // Moderate cleanup
+                shouldForceGC = true;
+                console.log(`📈 Moderate memory usage: ${beforeStats.memory.systemPercentage}% (${beforeStats.memory.rss}MB / 16GB)`);
+            } else if (beforeStats.memory.heapPercentage > 80) {
+                shouldForceGC = true; // Force GC if heap is > 80% full
+            }
+            
+            // Clean up old data files
+            if (fs.existsSync('./data')) {
+                const files = fs.readdirSync('./data')
+                    .filter(f => f.startsWith('sha256_submission_') && f.endsWith('.json'))
+                    .sort((a, b) => {
+                        const numA = parseInt(a.match(/\d+/)[0]);
+                        const numB = parseInt(b.match(/\d+/)[0]);
+                        return numB - numA; // Sort descending
+                    });
+                
+                if (files.length > maxDataFiles) {
+                    const filesToDelete = files.slice(maxDataFiles);
+                    filesToDelete.forEach(file => {
+                        try {
+                            fs.unlinkSync(path.join('./data', file));
+                        } catch (error) {
+                            // Ignore cleanup errors
+                        }
+                    });
+                    console.log(`🗑️  Cleaned up ${filesToDelete.length} old data files (keeping ${maxDataFiles})`);
+                }
+            }
+            
+            // Force garbage collection if needed
+            if (shouldForceGC && global.gc) {
+                global.gc();
+                console.log('♻️  Forced garbage collection');
+                
+                // Wait a bit for GC to complete
+                setTimeout(() => {
+                    const afterStats = this.getSystemStats();
+                    const memoryFreed = beforeStats.memory.heapUsed - afterStats.memory.heapUsed;
+                    const rssFreed = beforeStats.memory.rss - afterStats.memory.rss;
+                    
+                    console.log(`📊 After cleanup: ${afterStats.memory.heapUsed}MB heap, ${afterStats.memory.rss}MB RSS (${afterStats.memory.systemPercentage}% of 16GB)`);
+                    if (memoryFreed > 0) {
+                        console.log(`✅ Freed ${memoryFreed}MB heap, ${rssFreed}MB RSS`);
+                    }
+                }, 1000);
+            }
+            
+        } catch (error) {
+            console.error('❌ Error during memory cleanup:', error.message);
+        }
     }
     
     async reconnectSessionWithDerivedAccounts() {
@@ -975,9 +1116,12 @@ class RapidsnarkSHA256Pipeline {
     }
     
     async runContinuous(intervalSeconds = 30) {
+        const initialStats = this.getSystemStats();
         console.log(`🔄 Starting continuous mixed SHA256 proof submission every ${intervalSeconds} seconds...`);
         console.log(`🧮 Circuit: SHA256 (k≈20, 1,031,716 constraints, 16384-bit input)`);
         console.log(`👥 Mixed strategy: Account 1 (triple proof), Accounts 2-${this.derivedAccounts.length} (single proof)`);
+        console.log(`🖥️  System: 16GB RAM | Initial memory: ${initialStats.memory.rss}MB RSS (${initialStats.memory.systemPercentage}%)`);
+        console.log(`📊 Memory thresholds: Cleanup at >4.8GB (30%), Critical at >8GB (50%)`);
         
         const runCycle = async () => {
             try {
@@ -996,7 +1140,25 @@ class RapidsnarkSHA256Pipeline {
             const minutes = Math.floor((runtime % 3600) / 60);
             const seconds = runtime % 60;
             
+            // System resource monitoring
+            const systemStats = this.getSystemStats();
+            
             console.log(`📈 Runtime: ${hours}h ${minutes}m ${seconds}s | Success: ${this.stats.successful} | Failed: ${this.stats.failed}`);
+            console.log(`💾 Memory: ${systemStats.memory.heapUsed}MB heap (${systemStats.memory.heapPercentage}%) | ${systemStats.memory.rss}MB RSS (${systemStats.memory.systemPercentage}% of 16GB)`);
+            console.log(`🖥️  CPU: ${systemStats.cpu.user}ms user, ${systemStats.cpu.system}ms system | External: ${systemStats.memory.external}MB | Buffers: ${systemStats.memory.arrayBuffers}MB`);
+            
+            // Adaptive memory management based on 16GB system
+            if (systemStats.memory.systemPercentage > 50) { // > 8GB
+                console.log(`🚨 Critical memory usage: ${systemStats.memory.systemPercentage}% of 16GB system memory`);
+                this.performMemoryCleanup(true); // Force cleanup
+            } else if (systemStats.memory.systemPercentage > 30) { // > 4.8GB
+                console.log(`⚠️  High memory usage: ${systemStats.memory.systemPercentage}% of 16GB system memory`);
+                this.performMemoryCleanup();
+            } else if (systemStats.memory.heapUsed > 2048) { // > 2GB heap
+                console.log(`📊 Large heap detected: ${systemStats.memory.heapUsed}MB`);
+                this.performMemoryCleanup();
+            }
+            
             console.log(`⏳ Next parallel proof cycle in ${intervalSeconds} seconds...`);
             
             setTimeout(runCycle, intervalSeconds * 1000);
