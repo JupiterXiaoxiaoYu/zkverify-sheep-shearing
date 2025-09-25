@@ -242,12 +242,8 @@ class RapidsnarkSHA256Pipeline {
                         blockHash: eventData.blockHash
                     });
                     
-                    // Save aggregation data for future reference
+                    // Only log aggregation data, no file storage
                     try {
-                        if (!fs.existsSync('./data')) {
-                            fs.mkdirSync('./data');
-                        }
-                        
                         const aggregationData = {
                             blockHash: eventData.blockHash,
                             domainId: parseInt(eventData.data.domainId),
@@ -255,14 +251,9 @@ class RapidsnarkSHA256Pipeline {
                             timestamp: new Date().toISOString()
                         };
                         
-                        fs.writeFileSync(
-                            `./data/aggregation_${aggregationData.aggregationId}.json`, 
-                            JSON.stringify(aggregationData, null, 2)
-                        );
-                        
-                        console.log(`💾 Aggregation data saved for ID: ${aggregationData.aggregationId}`);
+                        console.log(`📧 Aggregation receipt: ID ${aggregationData.aggregationId}, Domain ${aggregationData.domainId}, Block ${eventData.blockHash.slice(0,8)}...`);
                     } catch (error) {
-                        console.error('❌ Error saving aggregation data:', error);
+                        console.error('❌ Error processing aggregation data:', error);
                     }
                 },
                 options: { domainId: 0 },
@@ -458,30 +449,8 @@ class RapidsnarkSHA256Pipeline {
                             events.removeListener(ZkVerifyEvents.IncludedInBlock, handleIncludedInBlock);
                             events.removeListener('error', handleError);
                             
-                            // Save submission details (limit file creation)
-                            if (this.stats.totalAttempts % 10 === 0) { // Only save every 10th submission
-                                try {
-                                    if (!fs.existsSync('./data')) {
-                                        fs.mkdirSync('./data');
-                                    }
-                                    
-                                    const submissionData = {
-                                        account: accountAddress,
-                                        accountIndex: accountIndex + 1,
-                                        statement: eventData.statement,
-                                        aggregationId: eventData.aggregationId,
-                                        timestamp: new Date().toISOString(),
-                                        publicSignalsCount: publicInputs.length
-                                    };
-                                    
-                                    fs.writeFileSync(
-                                        `./data/sha256_submission_${this.stats.totalAttempts}.json`, 
-                                        JSON.stringify(submissionData, null, 2)
-                                    );
-                                } catch (saveError) {
-                                    console.error('❌ Error saving submission data:', saveError);
-                                }
-                            }
+                            // Only log submission details, no file storage
+                            console.log(`✅ Submission ${this.stats.totalAttempts}: Account ${accountIndex + 1}, Statement ${eventData.statement}, AggregationID ${eventData.aggregationId}`);
                             
                             resolve(true);
                         };
@@ -916,8 +885,8 @@ class RapidsnarkSHA256Pipeline {
         // Update health server statistics
         this.healthServer.updateProofStats(this.stats.totalAttempts, this.stats.successful, this.stats.failed);
         
-        // Periodic memory cleanup every 100 cycles
-        if (this.stats.totalAttempts % 100 === 0) {
+        // Periodic memory cleanup every 50 cycles (more frequent)
+        if (this.stats.totalAttempts % 50 === 0) {
             this.performMemoryCleanup();
         }
     }
@@ -935,7 +904,7 @@ class RapidsnarkSHA256Pipeline {
                 external: Math.round(memUsage.external / 1024 / 1024), // MB
                 arrayBuffers: Math.round(memUsage.arrayBuffers / 1024 / 1024), // MB
                 heapPercentage: Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100),
-                systemPercentage: Math.round((memUsage.rss / (16 * 1024)) * 100) // 16GB system
+                systemPercentage: Math.round((memUsage.rss / (16 * 1024 * 1024 * 1024)) * 100) // 16GB system
             },
             cpu: {
                 user: Math.round(cpuUsage.user / 1000), // Convert microseconds to milliseconds
@@ -968,28 +937,8 @@ class RapidsnarkSHA256Pipeline {
                 shouldForceGC = true; // Force GC if heap is > 80% full
             }
             
-            // Clean up old data files
-            if (fs.existsSync('./data')) {
-                const files = fs.readdirSync('./data')
-                    .filter(f => f.startsWith('sha256_submission_') && f.endsWith('.json'))
-                    .sort((a, b) => {
-                        const numA = parseInt(a.match(/\d+/)[0]);
-                        const numB = parseInt(b.match(/\d+/)[0]);
-                        return numB - numA; // Sort descending
-                    });
-                
-                if (files.length > maxDataFiles) {
-                    const filesToDelete = files.slice(maxDataFiles);
-                    filesToDelete.forEach(file => {
-                        try {
-                            fs.unlinkSync(path.join('./data', file));
-                        } catch (error) {
-                            // Ignore cleanup errors
-                        }
-                    });
-                    console.log(`🗑️  Cleaned up ${filesToDelete.length} old data files (keeping ${maxDataFiles})`);
-                }
-            }
+            // No file cleanup needed since we don't store files
+            console.log('🗑️  No data files to clean up (file storage disabled)');
             
             // Force garbage collection if needed
             if (shouldForceGC && global.gc) {
