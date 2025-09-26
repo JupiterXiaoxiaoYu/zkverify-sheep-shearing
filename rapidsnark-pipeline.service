@@ -1,0 +1,23 @@
+[Unit]
+Description=Rapidsnark SHA256 Pipeline
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/mnt/c/Users/72988_kcozs1t/Desktop/zk-verifier/proof-submission
+Environment="NODE_OPTIONS=--max-old-space-size=12288 --expose-gc"
+ExecStart=/usr/bin/node rapidsnark-sha256-pipeline.cjs --continuous --interval 0
+
+# 自动重启配置
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+StartLimitBurst=0
+
+# 日志
+StandardOutput=append:/var/log/rapidsnark-pipeline.log
+StandardError=append:/var/log/rapidsnark-pipeline-error.log
+
+[Install]
+WantedBy=multi-user.target

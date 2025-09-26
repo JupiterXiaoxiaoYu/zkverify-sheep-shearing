@@ -9,7 +9,6 @@
     "submit-proof": "node index.js",
     "automated-single": "node automated-pipeline.cjs",
     "automated-continuous": "node automated-pipeline.cjs --continuous",
-    "automated-fast": "node automated-pipeline.cjs --continuous --interval 7",
     "rapidsnark-single": "node rapidsnark-sha256-pipeline.cjs",
     "rapidsnark-continuous": "node rapidsnark-sha256-pipeline.cjs --continuous",
     "rapidsnark-fast": "node rapidsnark-sha256-pipeline.cjs --continuous --interval 0"
