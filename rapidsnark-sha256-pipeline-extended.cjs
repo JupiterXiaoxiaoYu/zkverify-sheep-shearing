@@ -18,7 +18,7 @@ process.on('unhandledRejection', (reason, promise) => {
     console.log('🔄 Process will continue...');
 });
 
-class RapidsnarkSHA256Pipeline {
+class RapidsnarkSHA256PipelineExtended {
     constructor() {
         // Use Railway's persistent volume for caching large files
         this.cacheDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || './cache';
@@ -39,14 +39,15 @@ class RapidsnarkSHA256Pipeline {
         // Temporary file paths
         this.tempDir = '/tmp';
         
-        // zkVerify configuration
+        // zkVerify configuration - Extended to 12 additional accounts (beyond existing 8)
         this.session = null;
         this.accountSeed = process.env.SEED_PHRASE;
         this.derivedAccounts = [];
-        this.accountCount = 8; // Account 1 does triple proof, others do single proof
+        this.accountCount = 20; // 8 existing + 12 new = 20 total accounts
+        this.startIndex = 8; // Start from account 9-20 (12 new accounts)
         
         // Health server for Railway monitoring
-        this.healthServer = new HealthServer(process.env.PORT || 8080);
+        this.healthServer = new HealthServer((process.env.PORT || 8080) + 1); // Different port to avoid conflict
         
         // Statistics
         this.stats = {
@@ -165,7 +166,7 @@ class RapidsnarkSHA256Pipeline {
             this.verificationKey = JSON.parse(vkData);
             console.log('✅ SHA256 verification key loaded successfully');
             console.log(`📋 Protocol: ${this.verificationKey.protocol}, Curve: ${this.verificationKey.curve}`);
-            console.log(`🔢 Public inputs: ${this.verificationKey.nPublic}, Circuit size: k≈18 (281,376 constraints)`);
+            console.log(`🔢 Public inputs: ${this.verificationKey.nPublic}, Circuit size: k≈20 (1,031,716 constraints)`);
         } catch (error) {
             console.error('❌ Failed to load verification key:', error.message);
             throw error;
@@ -174,7 +175,8 @@ class RapidsnarkSHA256Pipeline {
     
     async initializeSession() {
         try {
-            console.log('🚀 Initializing automated proof pipeline with 8 parallel accounts...');
+            console.log('🚀 Initializing extended proof pipeline with 12 additional parallel accounts...');
+            console.log('📋 This pipeline uses accounts 9-20 (derived indices 8-19)');
             
             // Debug environment variables
             console.log('🔍 Environment debug:');
@@ -206,24 +208,28 @@ class RapidsnarkSHA256Pipeline {
             const baseAddress = accountInfo[0].address;
             console.log(`📍 Base account: ${baseAddress}`);
             
-            // Derive additional accounts for parallel processing
-            console.log(`🔄 Deriving ${this.accountCount - 1} additional accounts...`);
-            const derivedAddresses = await this.session.addDerivedAccounts(baseAddress, this.accountCount - 1);
+            // Derive ALL 19 accounts (to get accounts 9-20)
+            console.log(`🔄 Deriving ${this.accountCount - 1} accounts to access extended range...`);
+            const allDerivedAddresses = await this.session.addDerivedAccounts(baseAddress, this.accountCount - 1);
             
-            // Store all account addresses (base + derived)
-            this.derivedAccounts = [baseAddress, ...derivedAddresses];
+            // Store ALL account addresses (base + all derived)
+            const allAccounts = [baseAddress, ...allDerivedAddresses];
             
-            console.log(`✅ ${this.derivedAccounts.length} accounts ready - Account 1 triple proof, others single proof:`);
+            // Extract only the accounts we need (indices 8-19 = accounts 9-20)
+            this.derivedAccounts = allAccounts.slice(this.startIndex, this.accountCount);
+            
+            console.log(`✅ ${this.derivedAccounts.length} extended accounts ready (accounts 9-20, all single proof):`);
             this.derivedAccounts.forEach((address, index) => {
-                const mode = index === 0 ? '(triple proof)' : '(single proof)';
-                console.log(`   Account ${index + 1}: ${address} ${mode}`);
+                const actualAccountNumber = this.startIndex + index + 1; // +1 because accounts are 1-indexed
+                console.log(`   Account ${actualAccountNumber}: ${address} (single proof)`);
                 this.stats.accountStats[address] = { submitted: 0, successful: 0, failed: 0 };
             });
             
             // Set up event listeners
             this.setupEventListeners();
             
-            console.log('✅ Pipeline initialized successfully');
+            console.log('✅ Extended pipeline initialized successfully');
+            console.log(`🔥 Running 12 parallel accounts (9-20) with single proof strategy`);
             return true;
         } catch (error) {
             console.error('❌ Failed to initialize zkVerify session:', error.message);
@@ -272,7 +278,8 @@ class RapidsnarkSHA256Pipeline {
     
     getAccountTempPaths(accountIndex, proofId = '') {
         // Create unique temp file paths for each account and proof
-        const uniqueId = proofId ? `${accountIndex}_${proofId}` : `${accountIndex}`;
+        const actualAccountNumber = this.startIndex + accountIndex + 1;
+        const uniqueId = proofId ? `ext${actualAccountNumber}_${proofId}` : `ext${actualAccountNumber}`;
         const timestamp = Date.now();
         return {
             witnessPath: path.join(this.tempDir, `sha256_witness_${uniqueId}_${timestamp}.wtns`),
@@ -309,8 +316,9 @@ class RapidsnarkSHA256Pipeline {
     
     async generateWitnessWithSnarkjs(input, accountIndex, proofId = '') {
         return new Promise((resolve, reject) => {
+            const actualAccountNumber = this.startIndex + accountIndex + 1;
             const label = proofId ? `${proofId}` : 'single';
-            console.log(`🔨 Generating witness ${label} for account ${accountIndex + 1}...`);
+            console.log(`🔨 Generating witness ${label} for account ${actualAccountNumber}...`);
             
             const paths = this.getAccountTempPaths(accountIndex, proofId);
             
@@ -334,7 +342,7 @@ class RapidsnarkSHA256Pipeline {
             
             snarkjs.on('close', (code) => {
                 if (code === 0) {
-                    console.log(`✅ Witness ${label} generated successfully for account ${accountIndex + 1}`);
+                    console.log(`✅ Witness ${label} generated successfully for account ${actualAccountNumber}`);
                     resolve({ input, paths });
                 } else {
                     this.cleanupTempFiles(paths);
@@ -415,11 +423,12 @@ class RapidsnarkSHA256Pipeline {
     async submitProof(proofData, publicInputs, mockInputSummary, accountAddress, accountIndex, proofType = '') {
         const maxRetries = 3;
         let retryCount = 0;
+        const actualAccountNumber = this.startIndex + accountIndex + 1;
         
         while (retryCount < maxRetries) {
             try {
                 const proofLabel = proofType ? ` ${proofType}` : '';
-                console.log(`🔢 Submitting proof${proofLabel} from account ${accountIndex + 1} (${accountAddress.slice(0, 8)}...)...${retryCount > 0 ? ` (retry ${retryCount})` : ''}`);
+                console.log(`🔢 Submitting proof${proofLabel} from account ${actualAccountNumber} (${accountAddress.slice(0, 8)}...)...${retryCount > 0 ? ` (retry ${retryCount})` : ''}`);
                 
                 // Submit to zkVerify with promise wrapper to catch async errors
                 const submissionPromise = new Promise(async (resolve, reject) => {
@@ -437,7 +446,7 @@ class RapidsnarkSHA256Pipeline {
 
                         // Handle submission events with automatic cleanup
                         const handleIncludedInBlock = (eventData) => {
-                            console.log(`✅ Proof${proofLabel} from account ${accountIndex + 1} included in block:`, {
+                            console.log(`✅ Proof${proofLabel} from account ${actualAccountNumber} included in block:`, {
                                 account: `${accountAddress.slice(0, 8)}...`,
                                 statement: eventData.statement,
                                 aggregationId: eventData.aggregationId,
@@ -450,7 +459,7 @@ class RapidsnarkSHA256Pipeline {
                             events.removeListener('error', handleError);
                             
                             // Only log submission details, no file storage
-                            console.log(`✅ Submission ${this.stats.totalAttempts}: Account ${accountIndex + 1}, Statement ${eventData.statement}, AggregationID ${eventData.aggregationId}`);
+                            console.log(`✅ Submission ${this.stats.totalAttempts}: Account ${actualAccountNumber}, Statement ${eventData.statement}, AggregationID ${eventData.aggregationId}`);
                             
                             resolve(true);
                         };
@@ -490,7 +499,7 @@ class RapidsnarkSHA256Pipeline {
                 } else if (error) {
                     errorMessage = error.toString();
                 }
-                console.error(`❌ Error submitting proof${proofLabel} #${this.stats.totalAttempts} from account ${accountIndex + 1} (attempt ${retryCount}):`, errorMessage);
+                console.error(`❌ Error submitting proof${proofLabel} #${this.stats.totalAttempts} from account ${actualAccountNumber} (attempt ${retryCount}):`, errorMessage);
                 
                 // Check for specific errors that should trigger retry
                 const shouldRetry = 
@@ -502,69 +511,6 @@ class RapidsnarkSHA256Pipeline {
                     errorMessage.includes('timeout') ||
                     errorMessage.includes('not found in session') ||
                     errorMessage.includes('1014:');
-                
-                // Check for balance-related errors that should NOT retry but log account info
-                const isBalanceError = 
-                    errorMessage.includes('1010:') ||
-                    errorMessage.includes('Inability to pay some fees') ||
-                    errorMessage.includes('account balance too low') ||
-                    errorMessage.includes('InsufficientBalance');
-                
-                if (isBalanceError) {
-                    console.log(`💰 Balance issue detected for account ${accountIndex + 1}. Investigating...`);
-                    try {
-                        // Check account balance first
-                        const accountInfo = await this.session.getAccountInfo(accountAddress);
-                        const freeBalance = accountInfo[0].freeBalance;
-                        const reservedBalance = accountInfo[0].reservedBalance || '0';
-                        const nonce = accountInfo[0].nonce;
-                        
-                        const balanceValue = freeBalance ? (Number(BigInt(freeBalance.toString())) / 1e18).toFixed(3) : '0.000';
-                        const reservedValue = reservedBalance ? (Number(BigInt(reservedBalance.toString())) / 1e18).toFixed(3) : '0.000';
-                        
-                        console.log(`💰 Account ${accountIndex + 1} detailed info:`);
-                        console.log(`   Free balance: ${balanceValue} tokens`);
-                        console.log(`   Reserved balance: ${reservedValue} tokens`);
-                        console.log(`   Nonce: ${nonce}`);
-                        
-                        if (Number(balanceValue) >= 1.0) {
-                            console.log(`🔍 Account has sufficient balance (${balanceValue} tokens) but fee estimation failed.`);
-                            console.log(`💡 This may be a nonce/state synchronization issue, not a real balance problem.`);
-                            
-                            // Force session refresh for this account
-                            console.log(`🔄 Attempting to refresh account state for account ${accountIndex + 1}...`);
-                            
-                            if (retryCount < maxRetries) {
-                                console.log(`🔄 Will retry after session refresh (attempt ${retryCount + 1}/${maxRetries})`);
-                                
-                                // Try to reconnect session to refresh all account states
-                                try {
-                                    await this.reconnectSessionWithDerivedAccounts();
-                                    console.log('✅ Session refreshed, retrying submission...');
-                                    
-                                    // Allow retry with refreshed session
-                                    const retryDelay = 5000; // 5 seconds
-                                    console.log(`⏳ Waiting 5 seconds before retry with fresh session...`);
-                                    await new Promise(resolve => setTimeout(resolve, retryDelay));
-                                    continue; // Continue the retry loop
-                                    
-                                } catch (reconnectError) {
-                                    console.error('❌ Failed to refresh session:', reconnectError?.message || reconnectError);
-                                }
-                            }
-                        } else {
-                            console.log(`⚠️  Account ${accountIndex + 1} balance is critically low (${balanceValue} tokens). Needs funding!`);
-                        }
-                    } catch (balanceCheckError) {
-                        console.log(`❌ Failed to check balance for account ${accountIndex + 1}: ${balanceCheckError.message}`);
-                    }
-                    
-                    // If we get here, either balance is actually low or session refresh failed
-                    if (retryCount >= maxRetries) {
-                        console.log(`💡 Max retries reached. Account ${accountIndex + 1} either needs funding or has persistent state issues.`);
-                    }
-                    break;
-                }
                 
                 if (shouldRetry && retryCount < maxRetries) {
                     // Priority is too low错误使用3秒间隔，其他错误使用5秒
@@ -586,7 +532,7 @@ class RapidsnarkSHA256Pipeline {
                 } else {
                     // Either not a retryable error or max retries reached
                     if (retryCount >= maxRetries) {
-                        console.error(`❌ Max retries (${maxRetries}) reached for proof${proofLabel} #${this.stats.totalAttempts} from account ${accountIndex + 1}`);
+                        console.error(`❌ Max retries (${maxRetries}) reached for proof${proofLabel} #${this.stats.totalAttempts} from account ${actualAccountNumber}`);
                     }
                     // Don't throw error, just log and continue with next proof
                     break;
@@ -595,74 +541,13 @@ class RapidsnarkSHA256Pipeline {
         }
     }
     
-    async runSingleProofCycleStaggered(accountIndex, batchId = '') {
-        const accountAddress = this.derivedAccounts[accountIndex];
-        this.stats.accountStats[accountAddress].submitted++;
-        
-        try {
-            const startTime = Date.now();
-            console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting SHA256 proof for account ${accountIndex + 1} (${accountAddress.slice(0, 8)}...) [${batchId}]`);
-            
-            // Step 1: Generate random input for SHA256
-            const randomInput = this.generateRandomSHA256Input();
-            const inputSummary = {
-                totalBits: randomInput.length,
-                onesCount: randomInput.filter(bit => bit === 1).length,
-                zerosCount: randomInput.filter(bit => bit === 0).length,
-                firstBytes: randomInput.slice(0, 32).join('')
-            };
-            
-            console.log(`🎲 Generated random ${randomInput.length}-bit input for account ${accountIndex + 1}: ${inputSummary.onesCount} ones, ${inputSummary.zerosCount} zeros`);
-            
-            // Step 2: Generate witness
-            const witnessStart = Date.now();
-            console.log(`🔧 [${new Date().toLocaleTimeString()}] [${batchId}] Witness generation phase for account ${accountIndex + 1}`);
-            const witnessData = await this.generateWitnessWithSnarkjs(randomInput, accountIndex, 'single');
-            const witnessTime = Date.now() - witnessStart;
-            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Witness completed for account ${accountIndex + 1} (${witnessTime}ms)`);
-            
-            // Step 3: Generate proof with rapidsnark  
-            const proofStart = Date.now();
-            console.log(`⚡ [${new Date().toLocaleTimeString()}] [${batchId}] Proof generation phase for account ${accountIndex + 1}`);
-            const { proof, publicInputs } = await this.generateProofWithRapidsnark(witnessData, 'single');
-            const proofTime = Date.now() - proofStart;
-            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof completed for account ${accountIndex + 1} (${proofTime}ms)`);
-            
-            // Step 4: Submit proof to zkVerify
-            const submitStart = Date.now();
-            console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof submission phase for account ${accountIndex + 1}`);
-            await this.submitProof(proof, publicInputs, inputSummary, accountAddress, accountIndex, 'Single');
-            const submitTime = Date.now() - submitStart;
-            const totalTime = Date.now() - startTime;
-            
-            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] SHA256 proof cycle completed for account ${accountIndex + 1}!`);
-            console.log(`⏱️ [${batchId}] Timing - Witness: ${witnessTime}ms, Proof: ${proofTime}ms, Submit: ${submitTime}ms, Total: ${totalTime}ms\n`);
-            
-        } catch (error) {
-            this.stats.accountStats[accountAddress].failed++;
-            let errorMessage;
-            
-            try {
-                errorMessage = error?.message || JSON.stringify(error) || error.toString();
-            } catch (stringifyError) {
-                errorMessage = 'Unknown error occurred';
-            }
-            
-            console.error(`❌ SHA256 proof cycle failed for account ${accountIndex + 1}: ${errorMessage}\n`);
-            throw error;
-        }
-    }
-    
-    async runSingleProofCycle(accountIndex) {
-        return this.runSingleProofCycleStaggered(accountIndex, '');
-    }
-    
     async runSingleProofCycleAsync(accountIndex, batchId = '') {
         const accountAddress = this.derivedAccounts[accountIndex];
+        const actualAccountNumber = this.startIndex + accountIndex + 1;
         
         try {
             const startTime = Date.now();
-            console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting single SHA256 proof for account ${accountIndex + 1} (${accountAddress.slice(0, 8)}...) [${batchId}]`);
+            console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting single SHA256 proof for account ${actualAccountNumber} (${accountAddress.slice(0, 8)}...) [${batchId}]`);
             
             // Generate random input for SHA256
             const randomInput = this.generateRandomSHA256Input();
@@ -673,39 +558,39 @@ class RapidsnarkSHA256Pipeline {
                 firstBytes: randomInput.slice(0, 32).join('')
             };
             
-            console.log(`🎲 Generated random ${randomInput.length}-bit input for account ${accountIndex + 1}: ${inputSummary.onesCount} ones, ${inputSummary.zerosCount} zeros`);
+            console.log(`🎲 Generated random ${randomInput.length}-bit input for account ${actualAccountNumber}: ${inputSummary.onesCount} ones, ${inputSummary.zerosCount} zeros`);
             
             // Generate witness
             const witnessStart = Date.now();
-            console.log(`🔧 [${new Date().toLocaleTimeString()}] [${batchId}] Witness generation phase for account ${accountIndex + 1}`);
-            const witnessData = await this.generateWitnessWithSnarkjs(randomInput, accountIndex, 'async');
+            console.log(`🔧 [${new Date().toLocaleTimeString()}] [${batchId}] Witness generation phase for account ${actualAccountNumber}`);
+            const witnessData = await this.generateWitnessWithSnarkjs(randomInput, accountIndex, 'extended');
             const witnessTime = Date.now() - witnessStart;
-            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Witness completed for account ${accountIndex + 1} (${witnessTime}ms)`);
+            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Witness completed for account ${actualAccountNumber} (${witnessTime}ms)`);
             
             // Generate proof with rapidsnark  
             const proofStart = Date.now();
-            console.log(`⚡ [${new Date().toLocaleTimeString()}] [${batchId}] Proof generation phase for account ${accountIndex + 1}`);
-            const { proof, publicInputs } = await this.generateProofWithRapidsnark(witnessData, 'async');
+            console.log(`⚡ [${new Date().toLocaleTimeString()}] [${batchId}] Proof generation phase for account ${actualAccountNumber}`);
+            const { proof, publicInputs } = await this.generateProofWithRapidsnark(witnessData, 'extended');
             const proofTime = Date.now() - proofStart;
-            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof completed for account ${accountIndex + 1} (${proofTime}ms)`);
+            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof completed for account ${actualAccountNumber} (${proofTime}ms)`);
             
             // Submit proof asynchronously
             const submitStart = Date.now();
-            console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof submission initiated for account ${accountIndex + 1}`);
+            console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof submission initiated for account ${actualAccountNumber}`);
             
-            const submitPromise = this.submitProof(proof, publicInputs, inputSummary, accountAddress, accountIndex, 'Single').then(() => {
+            const submitPromise = this.submitProof(proof, publicInputs, inputSummary, accountAddress, accountIndex, 'Extended').then(() => {
                 const submitTime = Date.now() - submitStart;
-                console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof submit completed for account ${accountIndex + 1} (${submitTime}ms)`);
-                return { accountIndex, proofType: 'Single', success: true, submitTime };
+                console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof submit completed for account ${actualAccountNumber} (${submitTime}ms)`);
+                return { accountIndex, proofType: 'Extended', success: true, submitTime };
             }).catch((error) => {
                 const submitTime = Date.now() - submitStart;
                 const errorMessage = error?.message || JSON.stringify(error) || error.toString();
-                console.log(`❌ [${new Date().toLocaleTimeString()}] [${batchId}] Proof submit failed for account ${accountIndex + 1}: ${errorMessage}`);
-                return { accountIndex, proofType: 'Single', success: false, error: errorMessage, submitTime };
+                console.log(`❌ [${new Date().toLocaleTimeString()}] [${batchId}] Proof submit failed for account ${actualAccountNumber}: ${errorMessage}`);
+                return { accountIndex, proofType: 'Extended', success: false, error: errorMessage, submitTime };
             });
             
             const proofGenerationTime = Date.now() - startTime;
-            console.log(`🚀 [${new Date().toLocaleTimeString()}] [${batchId}] Single proof generation completed for account ${accountIndex + 1} (${proofGenerationTime}ms)`);
+            console.log(`🚀 [${new Date().toLocaleTimeString()}] [${batchId}] Extended proof generation completed for account ${actualAccountNumber} (${proofGenerationTime}ms)`);
             console.log(`⏱️ [${batchId}] Timing - Witness: ${witnessTime}ms, Proof: ${proofTime}ms, Total: ${proofGenerationTime}ms`);
             
             // Return submit promise for monitoring
@@ -720,159 +605,14 @@ class RapidsnarkSHA256Pipeline {
                 errorMessage = 'Unknown error occurred';
             }
             
-            console.error(`❌ Single SHA256 proof cycle failed for account ${accountIndex + 1}: ${errorMessage}\n`);
-            throw error;
-        }
-    }
-    
-    async runTripleProofCycleAsync(accountIndex, batchId = '') {
-        const accountAddress = this.derivedAccounts[accountIndex];
-        this.stats.accountStats[accountAddress].submitted += 3; // 三个proof
-        
-        try {
-            const startTime = Date.now();
-            console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting TRIPLE SHA256 proofs for account ${accountIndex + 1} (${accountAddress.slice(0, 8)}...) [${batchId}]`);
-            
-            // 生成三个不同的随机输入
-            const randomInput1 = this.generateRandomSHA256Input();
-            const randomInput2 = this.generateRandomSHA256Input();
-            const randomInput3 = this.generateRandomSHA256Input();
-            
-            const inputSummary1 = {
-                totalBits: randomInput1.length,
-                onesCount: randomInput1.filter(bit => bit === 1).length,
-                zerosCount: randomInput1.filter(bit => bit === 0).length,
-                firstBytes: randomInput1.slice(0, 32).join('')
-            };
-            
-            const inputSummary2 = {
-                totalBits: randomInput2.length,
-                onesCount: randomInput2.filter(bit => bit === 1).length,
-                zerosCount: randomInput2.filter(bit => bit === 0).length,
-                firstBytes: randomInput2.slice(0, 32).join('')
-            };
-            
-            const inputSummary3 = {
-                totalBits: randomInput3.length,
-                onesCount: randomInput3.filter(bit => bit === 1).length,
-                zerosCount: randomInput3.filter(bit => bit === 0).length,
-                firstBytes: randomInput3.slice(0, 32).join('')
-            };
-            
-            console.log(`🎲 Generated 3 random inputs for account ${accountIndex + 1}:`);
-            console.log(`   Input A: ${inputSummary1.onesCount} ones, ${inputSummary1.zerosCount} zeros`);
-            console.log(`   Input B: ${inputSummary2.onesCount} ones, ${inputSummary2.zerosCount} zeros`);
-            console.log(`   Input C: ${inputSummary3.onesCount} ones, ${inputSummary3.zerosCount} zeros`);
-            
-            // 并行生成三个witness
-            const witnessStart = Date.now();
-            console.log(`🔧 [${new Date().toLocaleTimeString()}] [${batchId}] Triple witness generation phase for account ${accountIndex + 1}`);
-            
-            const [witnessData1, witnessData2, witnessData3] = await Promise.all([
-                this.generateWitnessWithSnarkjs(randomInput1, accountIndex, 'A'),     // 使用唯一ID
-                this.generateWitnessWithSnarkjs(randomInput2, accountIndex, 'B'),     // 使用唯一ID
-                this.generateWitnessWithSnarkjs(randomInput3, accountIndex, 'C')      // 使用唯一ID
-            ]);
-            
-            const witnessTime = Date.now() - witnessStart;
-            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Triple witness completed for account ${accountIndex + 1} (${witnessTime}ms)`);
-            
-            // 并行生成三个proof
-            const proofStart = Date.now();
-            console.log(`⚡ [${new Date().toLocaleTimeString()}] [${batchId}] Triple proof generation phase for account ${accountIndex + 1}`);
-            
-            const [proof1Result, proof2Result, proof3Result] = await Promise.all([
-                this.generateProofWithRapidsnark(witnessData1, 'A'),
-                this.generateProofWithRapidsnark(witnessData2, 'B'),
-                this.generateProofWithRapidsnark(witnessData3, 'C')
-            ]);
-            
-            const proofTime = Date.now() - proofStart;
-            console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Triple proof completed for account ${accountIndex + 1} (${proofTime}ms)`);
-            
-            // 立即提交第一个proof
-            const submitStart1 = Date.now();
-            console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof A submission initiated for account ${accountIndex + 1} (immediate)`);
-            
-            const submitPromise1 = this.submitProof(proof1Result.proof, proof1Result.publicInputs, inputSummary1, accountAddress, accountIndex, 'A').then(() => {
-                const submitTime = Date.now() - submitStart1;
-                console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof A submit completed for account ${accountIndex + 1} (${submitTime}ms)`);
-                return { accountIndex, proofType: 'A', success: true, submitTime };
-            }).catch((error) => {
-                const submitTime = Date.now() - submitStart1;
-                const errorMessage = error?.message || JSON.stringify(error) || error.toString();
-                console.log(`❌ [${new Date().toLocaleTimeString()}] [${batchId}] Proof A submit failed for account ${accountIndex + 1}: ${errorMessage}`);
-                return { accountIndex, proofType: 'A', success: false, error: errorMessage, submitTime };
-            });
-            
-            // 延迟7秒提交第二个proof
-            const submitStart2 = Date.now();
-            console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof B submission scheduled for account ${accountIndex + 1} (+7s delay)`);
-            
-            const submitPromise2 = new Promise(async (resolve) => {
-                await new Promise(delay => setTimeout(delay, 7000)); // 7秒延迟
-                const actualSubmitStart = Date.now();
-                console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof B submission initiated for account ${accountIndex + 1} (delayed)`);
-                
-                this.submitProof(proof2Result.proof, proof2Result.publicInputs, inputSummary2, accountAddress, accountIndex, 'B').then(() => {
-                    const submitTime = Date.now() - actualSubmitStart;
-                    console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof B submit completed for account ${accountIndex + 1} (${submitTime}ms)`);
-                    resolve({ accountIndex, proofType: 'B', success: true, submitTime });
-                }).catch((error) => {
-                    const submitTime = Date.now() - actualSubmitStart;
-                    const errorMessage = error?.message || JSON.stringify(error) || error.toString();
-                    console.log(`❌ [${new Date().toLocaleTimeString()}] [${batchId}] Proof B submit failed for account ${accountIndex + 1}: ${errorMessage}`);
-                    resolve({ accountIndex, proofType: 'B', success: false, error: errorMessage, submitTime });
-                });
-            });
-            
-            // 延迟13秒提交第三个proof  
-            const submitStart3 = Date.now();
-            console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof C submission scheduled for account ${accountIndex + 1} (+13s delay)`);
-            
-            const submitPromise3 = new Promise(async (resolve) => {
-                await new Promise(delay => setTimeout(delay, 13000)); // 13秒延迟
-                const actualSubmitStart = Date.now();
-                console.log(`📤 [${new Date().toLocaleTimeString()}] [${batchId}] Proof C submission initiated for account ${accountIndex + 1} (delayed)`);
-                
-                this.submitProof(proof3Result.proof, proof3Result.publicInputs, inputSummary3, accountAddress, accountIndex, 'C').then(() => {
-                    const submitTime = Date.now() - actualSubmitStart;
-                    console.log(`✅ [${new Date().toLocaleTimeString()}] [${batchId}] Proof C submit completed for account ${accountIndex + 1} (${submitTime}ms)`);
-                    resolve({ accountIndex, proofType: 'C', success: true, submitTime });
-                }).catch((error) => {
-                    const submitTime = Date.now() - actualSubmitStart;
-                    const errorMessage = error?.message || JSON.stringify(error) || error.toString();
-                    console.log(`❌ [${new Date().toLocaleTimeString()}] [${batchId}] Proof C submit failed for account ${accountIndex + 1}: ${errorMessage}`);
-                    resolve({ accountIndex, proofType: 'C', success: false, error: errorMessage, submitTime });
-                });
-            });
-            
-            const proofGenerationTime = Date.now() - startTime;
-            console.log(`🚀 [${new Date().toLocaleTimeString()}] [${batchId}] Triple proof generation completed for account ${accountIndex + 1} (${proofGenerationTime}ms)`);
-            console.log(`⏱️ [${batchId}] Timing - Witness: ${witnessTime}ms, Proof: ${proofTime}ms, Total: ${proofGenerationTime}ms`);
-            console.log(`📋 [${batchId}] Submit schedule: Proof A (immediate), Proof B (+7s), Proof C (+13s)`);
-            
-            // 返回三个submit promises
-            return { submitPromises: [submitPromise1, submitPromise2, submitPromise3], accountIndex };
-            
-        } catch (error) {
-            this.stats.accountStats[accountAddress].failed += 3;
-            let errorMessage;
-            
-            try {
-                errorMessage = error?.message || JSON.stringify(error) || error.toString();
-            } catch (stringifyError) {
-                errorMessage = 'Unknown error occurred';
-            }
-            
-            console.error(`❌ Triple SHA256 proof cycle failed for account ${accountIndex + 1}: ${errorMessage}\n`);
+            console.error(`❌ Extended SHA256 proof cycle failed for account ${actualAccountNumber}: ${errorMessage}\n`);
             throw error;
         }
     }
     
     async runParallelProofCycles() {
         const cycleStartTime = Date.now();
-        console.log(`\n🚀 [${new Date().toLocaleTimeString()}] Starting full parallel proof generation across ${this.derivedAccounts.length} accounts...`);
+        console.log(`\n🚀 [${new Date().toLocaleTimeString()}] Starting full parallel proof generation across ${this.derivedAccounts.length} extended accounts (9-20)...`);
         
         // 健康检查：确保所有账号的统计数据存在
         this.ensureAccountStatsIntegrity();
@@ -881,53 +621,36 @@ class RapidsnarkSHA256Pipeline {
         const submitPromises = [];
         
         // 所有账户同时开始，不分batch
-        console.log(`📊 [${new Date().toLocaleTimeString()}] All ${this.derivedAccounts.length} accounts starting simultaneously`);
+        console.log(`📊 [${new Date().toLocaleTimeString()}] All ${this.derivedAccounts.length} extended accounts starting simultaneously`);
         
         const allProofPromises = this.derivedAccounts.map(async (accountAddress, index) => {
             try {
-                if (index === 0) {
-                    // Account 1 uses triple proof strategy
-                    const { submitPromises: tripleSubmitPromises, accountIndex } = await this.runTripleProofCycleAsync(index, `Account1-Triple`);
-                    // 添加三个submit promises到监控池
-                    tripleSubmitPromises.forEach((promise, proofIndex) => {
-                        const proofTypes = ['A', 'B', 'C'];
-                        submitPromises.push({ 
-                            accountIndex, 
-                            promise, 
-                            proofType: proofTypes[proofIndex] 
-                        });
-                    });
-                } else {
-                    // Other accounts use single proof strategy
-                    const accountAddress = this.derivedAccounts[index];
-                    this.stats.accountStats[accountAddress].submitted++;
-                    
-                    const submitPromise = await this.runSingleProofCycleAsync(index, `Account${index+1}-Single`);
-                    submitPromises.push({ 
-                        accountIndex: index, 
-                        promise: submitPromise, 
-                        proofType: 'Single' 
-                    });
-                }
+                // All extended accounts use single proof strategy
+                this.stats.accountStats[accountAddress].submitted++;
+                
+                const actualAccountNumber = this.startIndex + index + 1;
+                const submitPromise = await this.runSingleProofCycleAsync(index, `ExtAccount${actualAccountNumber}-Single`);
+                submitPromises.push({ 
+                    accountIndex: index, 
+                    promise: submitPromise, 
+                    proofType: 'Extended' 
+                });
+                
                 // Note: 成功统计在monitorAsyncSubmissions中处理
             } catch (error) {
-                if (index === 0) {
-                    this.stats.failed += 3; // 三个proof都失败
-                } else {
-                    this.stats.failed += 1; // 一个proof失败
-                }
+                this.stats.failed += 1; // 一个proof失败
                 // Error already logged in respective cycle methods
             }
         });
         
         // Wait for all proof generation to complete (不等待submit)
-        console.log(`⚡ [${new Date().toLocaleTimeString()}] Waiting for all ${this.derivedAccounts.length} proof generations to complete...`);
+        console.log(`⚡ [${new Date().toLocaleTimeString()}] Waiting for all ${this.derivedAccounts.length} extended proof generations to complete...`);
         await Promise.all(allProofPromises);
         
         const proofGenerationEndTime = Date.now();
         const proofGenerationTime = proofGenerationEndTime - cycleStartTime;
         
-        console.log(`🎯 [${new Date().toLocaleTimeString()}] All proof generation completed in ${(proofGenerationTime/1000).toFixed(1)}s`);
+        console.log(`🎯 [${new Date().toLocaleTimeString()}] All extended proof generation completed in ${(proofGenerationTime/1000).toFixed(1)}s`);
         console.log(`📋 Monitoring ${submitPromises.length} async submissions...`);
         
         // 异步监控submit结果 (不阻塞下一个cycle)
@@ -936,17 +659,17 @@ class RapidsnarkSHA256Pipeline {
         const cycleEndTime = Date.now();
         const totalCycleTime = cycleEndTime - cycleStartTime;
         
-        // Calculate total attempts: Account 1 = 3 proofs, others = 1 proof each
-        const totalAttemptsThisCycle = 3 + (this.derivedAccounts.length - 1);
+        // Calculate total attempts: All 12 accounts = 12 proofs
+        const totalAttemptsThisCycle = this.derivedAccounts.length;
         this.stats.totalAttempts += totalAttemptsThisCycle;
         
         // Print summary statistics with timing (proof generation only)
-        console.log(`\n📊 [${new Date().toLocaleTimeString()}] Mixed parallel cycle completed (proof generation):`);
-        console.log(`   Account 1 (triple): 3 proofs, Accounts 2-${this.derivedAccounts.length} (single): ${this.derivedAccounts.length - 1} proofs`);
+        console.log(`\n📊 [${new Date().toLocaleTimeString()}] Extended parallel cycle completed (proof generation):`);
+        console.log(`   Accounts 9-20 (extended): ${this.derivedAccounts.length} single proofs`);
         console.log(`   Total attempts this cycle: ${totalAttemptsThisCycle}`);
         console.log(`   Proof generation time: ${(proofGenerationTime/1000).toFixed(1)}s`);
         console.log(`   Submit monitoring: ${submitPromises.length} async submissions in progress`);
-        console.log(`   ⚡ Mixed strategy: Account 1 triple proof + ${this.derivedAccounts.length - 1} single proof accounts`);
+        console.log(`   ⚡ Extended strategy: ${this.derivedAccounts.length} parallel single proof accounts`);
         
         // Update health server statistics
         this.healthServer.updateProofStats(this.stats.totalAttempts, this.stats.successful, this.stats.failed);
@@ -960,12 +683,6 @@ class RapidsnarkSHA256Pipeline {
         if (this.stats.totalAttempts % 100 === 0) {
             console.log('\n🏥 Performing periodic account health check...');
             await this.validateAccountSessions();
-        }
-        
-        // Periodic balance check every 50 cycles to catch low balance issues early
-        if (this.stats.totalAttempts % 50 === 0) {
-            console.log('\n💰 Performing periodic balance check...');
-            await this.checkAllAccountBalances();
         }
     }
 
@@ -997,71 +714,22 @@ class RapidsnarkSHA256Pipeline {
         let fixedAccounts = 0;
         
         this.derivedAccounts.forEach((address, index) => {
+            const actualAccountNumber = this.startIndex + index + 1;
             if (!this.stats.accountStats[address]) {
-                console.log(`🔧 Restoring missing stats for account ${index + 1} (${address.slice(0, 8)}...)`);
+                console.log(`🔧 Restoring missing stats for account ${actualAccountNumber} (${address.slice(0, 8)}...)`);
                 this.stats.accountStats[address] = { submitted: 0, successful: 0, failed: 0 };
                 fixedAccounts++;
             }
         });
         
         if (fixedAccounts > 0) {
-            console.log(`✅ Restored stats for ${fixedAccounts} accounts`);
-        }
-    }
-    
-    async checkAllAccountBalances() {
-        try {
-            console.log('🔍 Checking balances for all accounts...');
-            
-            const lowBalanceAccounts = [];
-            const balanceThreshold = 1.0; // Threshold in tokens
-            
-            for (let i = 0; i < this.derivedAccounts.length; i++) {
-                const address = this.derivedAccounts[i];
-                const accountNumber = i + 1;
-                
-                try {
-                    const accountInfo = await this.session.getAccountInfo(address);
-                    const freeBalance = accountInfo[0].freeBalance;
-                    const balanceValue = freeBalance ? (Number(BigInt(freeBalance.toString())) / 1e18).toFixed(3) : '0.000';
-                    
-                    if (Number(balanceValue) < balanceThreshold) {
-                        lowBalanceAccounts.push({
-                            accountNumber: accountNumber,
-                            address: address,
-                            balance: balanceValue
-                        });
-                        console.log(`⚠️  Account ${accountNumber} (${address.slice(0, 8)}...): ${balanceValue} tokens (LOW)`);
-                    } else {
-                        console.log(`✅ Account ${accountNumber} (${address.slice(0, 8)}...): ${balanceValue} tokens`);
-                    }
-                    
-                    // Small delay between balance checks
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    
-                } catch (error) {
-                    console.log(`❌ Failed to check balance for account ${accountNumber}: ${error.message}`);
-                }
-            }
-            
-            if (lowBalanceAccounts.length > 0) {
-                console.log(`\n⚠️  WARNING: ${lowBalanceAccounts.length} accounts have low balances (<${balanceThreshold} tokens):`);
-                lowBalanceAccounts.forEach(account => {
-                    console.log(`   Account ${account.accountNumber}: ${account.balance} tokens - NEEDS FUNDING`);
-                });
-                console.log('\n💡 Consider running funding script for low balance accounts.');
-            } else {
-                console.log(`✅ All accounts have sufficient balances (>${balanceThreshold} tokens)`);
-            }
-            
-        } catch (error) {
-            console.error('❌ Error during balance check:', error.message);
+            console.log(`✅ Restored stats for ${fixedAccounts} extended accounts`);
         }
     }
     
     async validateAccountSessions() {
         // 验证所有账号的session是否有效
-        console.log('🔍 Validating account sessions...');
+        console.log('🔍 Validating extended account sessions...');
         
         try {
             // 检查主session
@@ -1071,15 +739,15 @@ class RapidsnarkSHA256Pipeline {
             }
             
             // 检查派生账号数量
-            if (this.derivedAccounts.length !== this.accountCount) {
-                throw new Error(`Derived accounts count mismatch: ${this.derivedAccounts.length} vs ${this.accountCount}`);
+            if (this.derivedAccounts.length !== (this.accountCount - this.startIndex)) {
+                throw new Error(`Extended accounts count mismatch: ${this.derivedAccounts.length} vs ${this.accountCount - this.startIndex}`);
             }
             
-            console.log(`✅ All ${this.derivedAccounts.length} account sessions validated`);
+            console.log(`✅ All ${this.derivedAccounts.length} extended account sessions validated`);
             return true;
             
         } catch (error) {
-            console.log(`❌ Session validation failed: ${error.message}`);
+            console.log(`❌ Extended session validation failed: ${error.message}`);
             console.log('🔄 Attempting full session recovery...');
             
             try {
@@ -1092,12 +760,12 @@ class RapidsnarkSHA256Pipeline {
                     throw new Error('Session recovery failed - account info still invalid');
                 }
                 
-                console.log('✅ Full session recovery completed and validated');
+                console.log('✅ Full extended session recovery completed and validated');
                 return true;
                 
             } catch (recoveryError) {
-                console.error('❌ Session recovery failed:', recoveryError.message);
-                console.log('🚨 CRITICAL: Session cannot be recovered, full restart recommended');
+                console.error('❌ Extended session recovery failed:', recoveryError.message);
+                console.log('🚨 CRITICAL: Extended session cannot be recovered, full restart recommended');
                 console.log('💡 Consider restarting the entire process to resolve fee/nonce issues');
                 
                 // 可以选择在这里触发程序退出，让auto-restart.sh重启
@@ -1111,7 +779,7 @@ class RapidsnarkSHA256Pipeline {
     performMemoryCleanup(forceCleanup = false) {
         try {
             const beforeStats = this.getSystemStats();
-            console.log('\n🧹 Performing memory cleanup...');
+            console.log('\n🧹 Performing extended memory cleanup...');
             console.log(`📊 Before cleanup: ${beforeStats.memory.heapUsed}MB heap, ${beforeStats.memory.rss}MB RSS (${beforeStats.memory.systemPercentage}% of 16GB)`);
             
             // Adjust cleanup strategy based on 16GB total memory
@@ -1152,13 +820,13 @@ class RapidsnarkSHA256Pipeline {
             }
             
         } catch (error) {
-            console.error('❌ Error during memory cleanup:', error.message);
+            console.error('❌ Error during extended memory cleanup:', error.message);
         }
     }
     
     async reconnectSessionWithDerivedAccounts() {
         try {
-            console.log('🔄 Full session reconnection and account state refresh...');
+            console.log('🔄 Full extended session reconnection and account state refresh...');
             
             // 完全清理旧session
             if (this.session) {
@@ -1175,7 +843,7 @@ class RapidsnarkSHA256Pipeline {
             await new Promise(resolve => setTimeout(resolve, 2000));
             
             // 重新建立完全新的session
-            console.log('🚀 Creating fresh zkVerify session...');
+            console.log('🚀 Creating fresh zkVerify session for extended accounts...');
             this.session = await zkVerifySession.start().Volta().withAccount(this.accountSeed);
             
             // 获取基础账号信息并等待状态同步
@@ -1187,15 +855,16 @@ class RapidsnarkSHA256Pipeline {
             console.log('⏳ Waiting for account state synchronization...');
             await new Promise(resolve => setTimeout(resolve, 3000));
             
-            // 重新派生所有账号
-            console.log(`🔄 Re-deriving ${this.accountCount - 1} fresh accounts...`);
-            const derivedAddresses = await this.session.addDerivedAccounts(baseAddress, this.accountCount - 1);
+            // 重新派生所有账号 (需要全部19个才能访问8-19索引)
+            console.log(`🔄 Re-deriving ${this.accountCount - 1} fresh accounts to access extended range...`);
+            const allDerivedAddresses = await this.session.addDerivedAccounts(baseAddress, this.accountCount - 1);
             
-            // 更新账号数组
-            this.derivedAccounts = [baseAddress, ...derivedAddresses];
+            // 重新提取我们需要的账号 (索引8-19)
+            const allAccounts = [baseAddress, ...allDerivedAddresses];
+            this.derivedAccounts = allAccounts.slice(this.startIndex, this.accountCount);
             
             // 等待派生账号状态同步
-            console.log('⏳ Waiting for derived accounts state synchronization...');
+            console.log('⏳ Waiting for extended accounts state synchronization...');
             await new Promise(resolve => setTimeout(resolve, 2000));
             
             // 重新设置事件监听器
@@ -1203,23 +872,24 @@ class RapidsnarkSHA256Pipeline {
             
             // 重新初始化所有账号的统计数据
             this.derivedAccounts.forEach((address, index) => {
+                const actualAccountNumber = this.startIndex + index + 1;
                 this.stats.accountStats[address] = { submitted: 0, successful: 0, failed: 0 };
-                console.log(`   Account ${index + 1}: ${address} (stats reset)`);
+                console.log(`   Account ${actualAccountNumber}: ${address} (stats reset)`);
             });
             
-            console.log(`✅ Full session reconnection completed with ${this.derivedAccounts.length} accounts`);
-            console.log('🔄 All account states synchronized and ready for proof submission');
+            console.log(`✅ Full extended session reconnection completed with ${this.derivedAccounts.length} accounts`);
+            console.log('🔄 All extended account states synchronized and ready for proof submission');
             
         } catch (error) {
-            console.error('❌ Failed to reconnect session with derived accounts:', error.message);
-            console.log('🚨 Critical: Session reconnection failed, program may need full restart');
+            console.error('❌ Failed to reconnect extended session with derived accounts:', error.message);
+            console.log('🚨 Critical: Extended session reconnection failed, program may need full restart');
             throw error;
         }
     }
     
     async monitorAsyncSubmissions(submitPromises, cycleStartTime) {
         // 在后台监控所有submit结果，不阻塞主流程
-        console.log(`🔍 [${new Date().toLocaleTimeString()}] Starting background monitoring of ${submitPromises.length} submissions...`);
+        console.log(`🔍 [${new Date().toLocaleTimeString()}] Starting background monitoring of ${submitPromises.length} extended submissions...`);
         
         try {
             const submitResults = await Promise.allSettled(submitPromises.map(item => item.promise));
@@ -1234,6 +904,7 @@ class RapidsnarkSHA256Pipeline {
             submitResults.forEach((result, index) => {
                 const accountIndex = submitPromises[index].accountIndex;
                 const accountAddress = this.derivedAccounts[accountIndex];
+                const actualAccountNumber = this.startIndex + accountIndex + 1;
                 
                 if (result.status === 'fulfilled' && result.value.success) {
                     successfulSubmits++;
@@ -1244,7 +915,7 @@ class RapidsnarkSHA256Pipeline {
                     }
                 } else {
                     failedSubmits++;
-                    console.log(`❌ Background submit failed for account ${accountIndex + 1}:`, result.reason || result.value?.error);
+                    console.log(`❌ Background submit failed for account ${actualAccountNumber}:`, result.reason || result.value?.error);
                     // 更新账户级别的失败统计
                     if (this.stats.accountStats[accountAddress]) {
                         this.stats.accountStats[accountAddress].failed++;
@@ -1257,7 +928,7 @@ class RapidsnarkSHA256Pipeline {
             const maxSubmitTime = submitTimes.length > 0 ? Math.max(...submitTimes) : 0;
             const minSubmitTime = submitTimes.length > 0 ? Math.min(...submitTimes) : 0;
             
-            console.log(`\n📈 [${new Date().toLocaleTimeString()}] Async Submit Results:`);
+            console.log(`\n📈 [${new Date().toLocaleTimeString()}] Extended Async Submit Results:`);
             console.log(`   ✅ Successful submissions: ${successfulSubmits}/${submitPromises.length}`);
             console.log(`   ❌ Failed submissions: ${failedSubmits}/${submitPromises.length}`);
             console.log(`   ⏱️ Submit timing - Avg: ${avgSubmitTime.toFixed(0)}ms, Min: ${minSubmitTime}ms, Max: ${maxSubmitTime}ms`);
@@ -1268,31 +939,32 @@ class RapidsnarkSHA256Pipeline {
             this.stats.failed += failedSubmits;
             
             // 打印最终账户统计
-            console.log(`\n📈 Final Account Statistics:`);
+            console.log(`\n📈 Final Extended Account Statistics:`);
             this.derivedAccounts.forEach((address, index) => {
+                const actualAccountNumber = this.startIndex + index + 1;
                 const stats = this.stats.accountStats[address];
                 if (stats) {
                     const successful = stats.successful || 0;
                     const submitted = stats.submitted || 0;
                     const successRate = submitted > 0 ? ((successful / submitted) * 100).toFixed(1) : 0;
-                    console.log(`   Account ${index + 1} (${address.slice(0, 8)}...): ${successful}/${submitted} successful (${successRate}%)`);
+                    console.log(`   Account ${actualAccountNumber} (${address.slice(0, 8)}...): ${successful}/${submitted} successful (${successRate}%)`);
                 } else {
-                    console.log(`   Account ${index + 1} (${address.slice(0, 8)}...): ⚠️  Stats missing - will restore next cycle`);
+                    console.log(`   Account ${actualAccountNumber} (${address.slice(0, 8)}...): ⚠️  Stats missing - will restore next cycle`);
                     // 立即修复缺失的统计
                     this.stats.accountStats[address] = { submitted: 0, successful: 0, failed: 0 };
                 }
             });
             
         } catch (error) {
-            console.error(`❌ Error monitoring async submissions:`, error.message);
+            console.error(`❌ Error monitoring extended async submissions:`, error.message);
         }
     }
     
     async runContinuous(intervalSeconds = 30) {
         const initialStats = this.getSystemStats();
-        console.log(`🔄 Starting continuous mixed SHA256 proof submission every ${intervalSeconds} seconds...`);
+        console.log(`🔄 Starting continuous extended SHA256 proof submission every ${intervalSeconds} seconds...`);
         console.log(`🧮 Circuit: SHA256 (k≈20, 1,031,716 constraints, 16384-bit input)`);
-        console.log(`👥 Mixed strategy: Account 1 (triple proof), Accounts 2-${this.derivedAccounts.length} (single proof)`);
+        console.log(`👥 Extended strategy: Accounts 9-20 (all single proof)`);
         console.log(`🖥️  System: 16GB RAM | Initial memory: ${initialStats.memory.rss}MB RSS (${initialStats.memory.systemPercentage}%)`);
         console.log(`📊 Memory thresholds: Cleanup at >4.8GB (30%), Critical at >8GB (50%)`);
         
@@ -1303,7 +975,7 @@ class RapidsnarkSHA256Pipeline {
                 // Note: Aggregation receipts will arrive asynchronously and be logged when received
                 
             } catch (error) {
-                console.error('❌ Error in parallel proof cycle:', error);
+                console.error('❌ Error in extended parallel proof cycle:', error);
                 // Continue with next cycle
             }
             
@@ -1316,7 +988,7 @@ class RapidsnarkSHA256Pipeline {
             // System resource monitoring
             const systemStats = this.getSystemStats();
             
-            console.log(`📈 Runtime: ${hours}h ${minutes}m ${seconds}s | Success: ${this.stats.successful} | Failed: ${this.stats.failed}`);
+            console.log(`📈 Extended Runtime: ${hours}h ${minutes}m ${seconds}s | Success: ${this.stats.successful} | Failed: ${this.stats.failed}`);
             console.log(`💾 Memory: ${systemStats.memory.heapUsed}MB heap (${systemStats.memory.heapPercentage}%) | ${systemStats.memory.rss}MB RSS (${systemStats.memory.systemPercentage}% of 16GB)`);
             console.log(`🖥️  CPU: ${systemStats.cpu.user}ms user, ${systemStats.cpu.system}ms system | External: ${systemStats.memory.external}MB | Buffers: ${systemStats.memory.arrayBuffers}MB`);
             
@@ -1332,7 +1004,7 @@ class RapidsnarkSHA256Pipeline {
                 this.performMemoryCleanup();
             }
             
-            console.log(`⏳ Next parallel proof cycle in ${intervalSeconds} seconds...`);
+            console.log(`⏳ Next extended parallel proof cycle in ${intervalSeconds} seconds...`);
             
             setTimeout(runCycle, intervalSeconds * 1000);
         };
@@ -1344,10 +1016,10 @@ class RapidsnarkSHA256Pipeline {
     async runSingle() {
         try {
             await this.runParallelProofCycles();
-            console.log('✅ Single parallel SHA256 proof submission completed');
+            console.log('✅ Single extended parallel SHA256 proof submission completed');
             process.exit(0);
         } catch (error) {
-            console.error('❌ Single parallel SHA256 proof submission failed');
+            console.error('❌ Single extended parallel SHA256 proof submission failed');
             process.exit(1);
         }
     }
@@ -1355,12 +1027,12 @@ class RapidsnarkSHA256Pipeline {
 
 // Main execution
 async function main() {
-    pipeline = new RapidsnarkSHA256Pipeline();
+    pipeline = new RapidsnarkSHA256PipelineExtended();
     const args = process.argv.slice(2);
     
     // Initialize session and event listeners first
     if (!await pipeline.initializeSession()) {
-        console.error('❌ Failed to initialize zkVerify session. Exiting.');
+        console.error('❌ Failed to initialize extended zkVerify session. Exiting.');
         process.exit(1);
     }
     
@@ -1379,7 +1051,7 @@ async function main() {
 let pipeline = null;
 
 process.on('SIGINT', () => {
-    console.log('\n🛑 Received SIGINT. Shutting down gracefully...');
+    console.log('\n🛑 Received SIGINT. Shutting down extended pipeline gracefully...');
     if (pipeline && pipeline.healthServer) {
         pipeline.healthServer.stop();
     }
@@ -1387,7 +1059,7 @@ process.on('SIGINT', () => {
 });
 
 process.on('SIGTERM', () => {
-    console.log('\n🛑 Received SIGTERM. Shutting down gracefully...');
+    console.log('\n🛑 Received SIGTERM. Shutting down extended pipeline gracefully...');
     if (pipeline && pipeline.healthServer) {
         pipeline.healthServer.stop();
     }
@@ -1395,6 +1067,6 @@ process.on('SIGTERM', () => {
 });
 
 main().catch((error) => {
-    console.error('❌ Fatal error in main:', error.message || error);
+    console.error('❌ Fatal error in extended main:', error.message || error);
     process.exit(1);
 });
