@@ -961,15 +961,29 @@ class RapidsnarkSHA256Pipeline {
             
         } catch (error) {
             console.log(`❌ Session validation failed: ${error.message}`);
-            console.log('🔄 Attempting session recovery...');
+            console.log('🔄 Attempting full session recovery...');
             
             try {
                 await this.reconnectSessionWithDerivedAccounts();
                 this.ensureAccountStatsIntegrity();
-                console.log('✅ Session recovery completed');
+                
+                // 验证重连后的session是否正常
+                const testAccountInfo = await this.session.getAccountInfo();
+                if (!testAccountInfo || testAccountInfo.length === 0) {
+                    throw new Error('Session recovery failed - account info still invalid');
+                }
+                
+                console.log('✅ Full session recovery completed and validated');
                 return true;
+                
             } catch (recoveryError) {
                 console.error('❌ Session recovery failed:', recoveryError.message);
+                console.log('🚨 CRITICAL: Session cannot be recovered, full restart recommended');
+                console.log('💡 Consider restarting the entire process to resolve fee/nonce issues');
+                
+                // 可以选择在这里触发程序退出，让auto-restart.sh重启
+                // process.exit(1);
+                
                 return false;
             }
         }
@@ -1025,32 +1039,61 @@ class RapidsnarkSHA256Pipeline {
     
     async reconnectSessionWithDerivedAccounts() {
         try {
-            console.log('🔄 Reconnecting session and restoring derived accounts...');
+            console.log('🔄 Full session reconnection and account state refresh...');
             
-            // Reconnect base session
+            // 完全清理旧session
+            if (this.session) {
+                try {
+                    // 尝试优雅关闭旧session
+                    await this.session.close();
+                } catch (closeError) {
+                    console.log('⚠️ Old session close failed, continuing with new session');
+                }
+                this.session = null;
+            }
+            
+            // 等待一段时间确保旧连接完全关闭
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // 重新建立完全新的session
+            console.log('🚀 Creating fresh zkVerify session...');
             this.session = await zkVerifySession.start().Volta().withAccount(this.accountSeed);
             
-            // Get base account address
+            // 获取基础账号信息并等待状态同步
             const accountInfo = await this.session.getAccountInfo();
             const baseAddress = accountInfo[0].address;
+            console.log(`📍 Base account reconnected: ${baseAddress}`);
             
-            // Re-derive all accounts
-            console.log(`🔄 Re-deriving ${this.accountCount - 1} accounts...`);
+            // 等待账号状态完全同步
+            console.log('⏳ Waiting for account state synchronization...');
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // 重新派生所有账号
+            console.log(`🔄 Re-deriving ${this.accountCount - 1} fresh accounts...`);
             const derivedAddresses = await this.session.addDerivedAccounts(baseAddress, this.accountCount - 1);
             
-            // Update the derived accounts array
+            // 更新账号数组
             this.derivedAccounts = [baseAddress, ...derivedAddresses];
             
-            // Setup event listeners
+            // 等待派生账号状态同步
+            console.log('⏳ Waiting for derived accounts state synchronization...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // 重新设置事件监听器
             this.setupEventListeners();
             
-            console.log(`✅ Session reconnected with ${this.derivedAccounts.length} accounts`);
+            // 重新初始化所有账号的统计数据
             this.derivedAccounts.forEach((address, index) => {
-                console.log(`   Account ${index + 1}: ${address}`);
+                this.stats.accountStats[address] = { submitted: 0, successful: 0, failed: 0 };
+                console.log(`   Account ${index + 1}: ${address} (stats reset)`);
             });
+            
+            console.log(`✅ Full session reconnection completed with ${this.derivedAccounts.length} accounts`);
+            console.log('🔄 All account states synchronized and ready for proof submission');
             
         } catch (error) {
             console.error('❌ Failed to reconnect session with derived accounts:', error.message);
+            console.log('🚨 Critical: Session reconnection failed, program may need full restart');
             throw error;
         }
     }
