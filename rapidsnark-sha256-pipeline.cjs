@@ -811,6 +811,9 @@ class RapidsnarkSHA256Pipeline {
         const cycleStartTime = Date.now();
         console.log(`\n🚀 [${new Date().toLocaleTimeString()}] Starting full parallel proof generation across ${this.derivedAccounts.length} accounts...`);
         
+        // 健康检查：确保所有账号的统计数据存在
+        this.ensureAccountStatsIntegrity();
+        
         // Promise池管理 - 收集所有submit promises
         const submitPromises = [];
         
@@ -889,6 +892,12 @@ class RapidsnarkSHA256Pipeline {
         if (this.stats.totalAttempts % 50 === 0) {
             this.performMemoryCleanup();
         }
+        
+        // Periodic account health check every 100 cycles (every ~50 minutes at 30s intervals)
+        if (this.stats.totalAttempts % 100 === 0) {
+            console.log('\n🏥 Performing periodic account health check...');
+            await this.validateAccountSessions();
+        }
     }
 
     getSystemStats() {
@@ -913,6 +922,57 @@ class RapidsnarkSHA256Pipeline {
         };
         
         return stats;
+    }
+
+    ensureAccountStatsIntegrity() {
+        let fixedAccounts = 0;
+        
+        this.derivedAccounts.forEach((address, index) => {
+            if (!this.stats.accountStats[address]) {
+                console.log(`🔧 Restoring missing stats for account ${index + 1} (${address.slice(0, 8)}...)`);
+                this.stats.accountStats[address] = { submitted: 0, successful: 0, failed: 0 };
+                fixedAccounts++;
+            }
+        });
+        
+        if (fixedAccounts > 0) {
+            console.log(`✅ Restored stats for ${fixedAccounts} accounts`);
+        }
+    }
+    
+    async validateAccountSessions() {
+        // 验证所有账号的session是否有效
+        console.log('🔍 Validating account sessions...');
+        
+        try {
+            // 检查主session
+            const accountInfo = await this.session.getAccountInfo();
+            if (!accountInfo || accountInfo.length === 0) {
+                throw new Error('Main session invalid');
+            }
+            
+            // 检查派生账号数量
+            if (this.derivedAccounts.length !== this.accountCount) {
+                throw new Error(`Derived accounts count mismatch: ${this.derivedAccounts.length} vs ${this.accountCount}`);
+            }
+            
+            console.log(`✅ All ${this.derivedAccounts.length} account sessions validated`);
+            return true;
+            
+        } catch (error) {
+            console.log(`❌ Session validation failed: ${error.message}`);
+            console.log('🔄 Attempting session recovery...');
+            
+            try {
+                await this.reconnectSessionWithDerivedAccounts();
+                this.ensureAccountStatsIntegrity();
+                console.log('✅ Session recovery completed');
+                return true;
+            } catch (recoveryError) {
+                console.error('❌ Session recovery failed:', recoveryError.message);
+                return false;
+            }
+        }
     }
 
     performMemoryCleanup(forceCleanup = false) {
@@ -1055,7 +1115,9 @@ class RapidsnarkSHA256Pipeline {
                     const successRate = submitted > 0 ? ((successful / submitted) * 100).toFixed(1) : 0;
                     console.log(`   Account ${index + 1} (${address.slice(0, 8)}...): ${successful}/${submitted} successful (${successRate}%)`);
                 } else {
-                    console.log(`   Account ${index + 1} (${address.slice(0, 8)}...): No stats available`);
+                    console.log(`   Account ${index + 1} (${address.slice(0, 8)}...): ⚠️  Stats missing - will restore next cycle`);
+                    // 立即修复缺失的统计
+                    this.stats.accountStats[address] = { submitted: 0, successful: 0, failed: 0 };
                 }
             });
             
