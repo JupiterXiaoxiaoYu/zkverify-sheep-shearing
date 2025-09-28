@@ -421,6 +421,19 @@ class RapidsnarkSHA256Pipeline {
                 const proofLabel = proofType ? ` ${proofType}` : '';
                 console.log(`🔢 Submitting proof${proofLabel} from account ${accountIndex + 1} (${accountAddress.slice(0, 8)}...)...${retryCount > 0 ? ` (retry ${retryCount})` : ''}`);
                 
+                // Validate account is in session before submission
+                try {
+                    console.log(`🔍 Validating account ${accountIndex + 1} is registered in session...`);
+                    const accountInfo = await this.session.getAccountInfo(accountAddress);
+                    if (!accountInfo || accountInfo.length === 0) {
+                        throw new Error(`Account ${accountAddress} not found in session during pre-submission validation`);
+                    }
+                    console.log(`✅ Account ${accountIndex + 1} validated in session`);
+                } catch (validationError) {
+                    console.log(`❌ Account validation failed for account ${accountIndex + 1}: ${validationError.message}`);
+                    throw validationError; // This will trigger the retry logic with session reconnection
+                }
+                
                 // Submit to zkVerify with promise wrapper to catch async errors
                 const submissionPromise = new Promise(async (resolve, reject) => {
                     try {
@@ -503,6 +516,11 @@ class RapidsnarkSHA256Pipeline {
                     errorMessage.includes('not found in session') ||
                     errorMessage.includes('1014:');
                 
+                // Check for account session errors that require immediate session refresh
+                const isAccountSessionError = 
+                    errorMessage.includes('not found in session') ||
+                    (errorMessage.includes('Account') && errorMessage.includes('not found'));
+                
                 // Check for balance-related errors that should NOT retry but log account info
                 const isBalanceError = 
                     errorMessage.includes('1010:') ||
@@ -562,6 +580,43 @@ class RapidsnarkSHA256Pipeline {
                     // If we get here, either balance is actually low or session refresh failed
                     if (retryCount >= maxRetries) {
                         console.log(`💡 Max retries reached. Account ${accountIndex + 1} either needs funding or has persistent state issues.`);
+                    }
+                    break;
+                }
+                
+                // Handle account session errors specifically
+                if (isAccountSessionError) {
+                    console.log(`🔍 Account session error detected for account ${accountIndex + 1}:`, errorMessage);
+                    console.log(`📧 Account address: ${accountAddress}`);
+                    console.log(`🔄 This account was lost from the zkVerifyjs session state.`);
+                    
+                    if (retryCount < maxRetries) {
+                        console.log(`🔄 Forcing immediate session reconnection to re-register all accounts...`);
+                        
+                        try {
+                            await this.reconnectSessionWithDerivedAccounts();
+                            console.log('✅ Session reconnected, all accounts re-registered');
+                            
+                            // Verify the account is now in session
+                            const testAccountInfo = await this.session.getAccountInfo(accountAddress);
+                            if (testAccountInfo && testAccountInfo.length > 0) {
+                                console.log(`✅ Account ${accountIndex + 1} (${accountAddress.slice(0, 8)}...) successfully re-registered in session`);
+                                
+                                // Wait a bit for the session to stabilize
+                                console.log('⏳ Waiting 3 seconds for session to stabilize...');
+                                await new Promise(resolve => setTimeout(resolve, 3000));
+                                continue; // Retry immediately with fresh session
+                            } else {
+                                console.error(`❌ Account ${accountIndex + 1} still not found after session reconnection`);
+                            }
+                        } catch (reconnectError) {
+                            console.error('❌ Failed to reconnect session for account error:', reconnectError?.message || reconnectError);
+                        }
+                    }
+                    
+                    // If we can't fix the session or max retries reached, continue to next account
+                    if (retryCount >= maxRetries) {
+                        console.log(`❌ Max retries reached for account session error. Account ${accountIndex + 1} skipped.`);
                     }
                     break;
                 }

@@ -44,7 +44,7 @@ class RapidsnarkSHA256PipelineExtended {
         this.accountSeed = process.env.SEED_PHRASE;
         this.derivedAccounts = [];
         this.accountCount = 20; // 8 existing + 12 new = 20 total accounts
-        this.startIndex = 8; // Start from account 9-20 (12 new accounts)
+        this.startIndex = 1; // Start from account 9-20 (12 new accounts)
         
         // Health server for Railway monitoring
         this.healthServer = new HealthServer((process.env.PORT || 8080) + 1); // Different port to avoid conflict
